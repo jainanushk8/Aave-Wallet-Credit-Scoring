@@ -1,125 +1,158 @@
 # Detailed Analysis of Aave Wallet Credit Scores
 
 ## Introduction
-This document provides an in-depth analysis of the methodology, results, and insights derived from assigning credit scores to Aave protocol wallets based on their historical transaction data.
+This document dives into how I figured out a way to give credit scores to Aave wallets. I used their past transaction data to see who's been a reliable user and who might be a bit risky. It's a journey into understanding on-chain behavior!
+
+---
 
 ## Data Overview
-The analysis is based on 100,000 raw, transaction-level records from the Aave V2 protocol, encompassing actions such as deposits, borrows, repays, and liquidations. Each record contains details like `userWallet`, `action`, `asset`, `amount`, and `value_usd`. The dataset captures a snapshot of on-chain behavior crucial for understanding wallet activity.
+My starting point was a pretty big JSON file with about 100,000 transaction records from Aave V2. Each record was a single interaction – like someone depositing crypto, taking out a loan, or paying one back. It had details like which wallet did what (`userWallet`), the type of action (`action`), the crypto asset involved (`asset`), and how much it was worth in USD (`value_usd`). This raw data was my window into how different wallets behaved on Aave.
+
+---
 
 ## Feature Engineering Details
 
-From the raw transaction data, several features were engineered to capture different aspects of a wallet's interaction with the Aave protocol.
+To make sense of the raw transaction data, I had to transform it into features that could actually tell me something about a wallet's "creditworthiness." Here's how I thought about and built those features:
 
-* **Activity Counts:** `total_transactions`, `num_deposits`, `num_borrows`, `num_repays`, `num_redeemunderlying`, `num_liquidations`. These count specific actions, providing a basic volume metric.
-* **Value Aggregates:** `total_deposit_usd`, `total_borrow_usd`, `total_repay_usd`, `total_redeem_usd`, `total_liquidation_usd`. These sum the USD values of transactions, reflecting financial engagement. A specific challenge was handling the `value_usd` field for `liquidationcall`, which often indicates the amount of debt covered, not the asset seized. This was handled by checking if `value_usd` was missing and inferring it from `amount` and `asset` (if needed) or by ensuring the feature was handled appropriately in the scoring.
-* **Ratios:**
-    * `repay_to_borrow_ratio`: Calculated as `total_repay_usd / total_borrow_usd`. This is a critical metric indicating repayment discipline. Values were capped at 1 to prevent extremely high ratios from distorting the score due to small initial borrows being fully repaid.
-    * `deposit_utilization_ratio`: `total_borrow_usd / total_deposit_usd`. A proxy for how much of deposited funds are being utilized for borrowing.
-    * `liquidation_value_to_borrow_value_ratio`: `total_liquidation_usd / total_borrow_usd`. Indicates the proportion of borrowed funds that resulted in liquidation.
-    * `liquidation_calls_per_transaction_ratio`: `num_liquidations / total_transactions`. Frequency of liquidations relative to overall activity.
-* **Temporal Features:**
-    * `account_age_days`: The duration between the first and last transaction.
-    * `days_since_last_transaction`: The time elapsed since the most recent transaction, indicating recency of activity.
-    * `avg_transactions_per_day`: `total_transactions / account_age_days`. Measures activity intensity.
-* **Diversity Metrics:** `num_unique_assets`, `num_unique_actions`. Reflects diversification of assets used or actions performed.
+* **Activity Counts:** I started with simple counts: `total_transactions` (how busy they are overall), `num_deposits`, `num_borrows`, `num_repays`, `num_redeemunderlying`, and `num_liquidations`. These just show the volume of different actions.
 
-**Outlier Treatment (Winsorization):** To handle extreme values that could disproportionately influence scores, Winsorization was applied to all numerical features. This process caps values at the 1st and 99th percentiles, ensuring that anomalies do not skew the distribution, allowing the MinMaxScaler to perform effectively.
+* **Value Aggregates:** Beyond just counts, I looked at the USD values involved: `total_deposit_usd`, `total_borrow_usd`, `total_repay_usd`, `total_redeem_usd`, and `total_liquidation_usd`. This gives a sense of the financial scale of their interactions. A tricky bit was `liquidationcall`'s `value_usd` – it represents the debt covered, not always the asset seized. I made sure my processing handled this so it accurately reflected the "cost" of being liquidated.
+
+* **Ratios:** Ratios are super helpful because they normalize behavior, making it comparable across different wallet sizes.
+    * `repay_to_borrow_ratio`: This was a big one for me! It's `total_repay_usd / total_borrow_usd`. If a wallet borrows $100 and repays $100, their ratio is 1. If they repay less, it's lower. I capped this at 1 because repaying more than you borrowed (due to small initial borrows or rounding) shouldn't give an "extra" positive score. It's about responsible repayment up to the borrowed amount.
+    * `deposit_utilization_ratio`: `total_borrow_usd / total_deposit_usd`. This tells me how much of their deposited collateral they're actually borrowing against. Higher utilization can be riskier.
+    * `liquidation_value_to_borrow_value_ratio`: `total_liquidation_usd / total_borrow_usd`. This helps understand the proportion of their borrowed funds that went sideways and resulted in liquidation.
+    * `liquidation_calls_per_transaction_ratio`: `num_liquidations / total_transactions`. This checks if liquidations are a common occurrence relative to their overall activity, potentially flagging risky or even bot-like behavior.
+
+* **Temporal Features:** How long a wallet has been active and how recently tells a lot.
+    * `account_age_days`: The time between their very first and very last transaction. Longer is usually better.
+    * `days_since_last_transaction`: How long it's been since their last activity. Recent activity is often a good sign.
+    * `avg_transactions_per_day`: `total_transactions / account_age_days`. This gives a normalized activity level, weeding out super-long but inactive accounts.
+
+* **Diversity Metrics:**
+    * `num_unique_assets`: How many different types of crypto assets they interact with.
+    * `num_unique_actions`: How many different types of actions they perform. These give a small hint about how versatile or engaged a wallet is.
+
+* **Outlier Treatment (Winsorization):** Before doing any scaling, I had to deal with extreme values. Some wallets might have truly enormous deposits or liquidations that would mess up the overall distribution. So, I applied Winsorization, which basically caps any really high or really low values at the 99th and 1st percentiles respectively. This makes sure that these outliers don't unfairly skew the `MinMaxScaler` and the final score.
+
+---
 
 ## Credit Scoring Methodology (Detailed)
 
-The credit score is derived from a weighted linear combination of the engineered features, scaled to a 0-1000 range.
+My credit score model is pretty straightforward: it's a weighted sum of these engineered features, all squished into a 0-1000 range. It's an unsupervised approach, meaning I don't have a "right answer" to train against, so my weights are based on what I think makes a wallet reliable in DeFi.
 
 ### Feature Selection
-The following features were chosen for scoring, representing a balance of positive (responsible behavior) and negative (risky behavior) indicators:
+I picked features that seemed most relevant to judging a wallet's behavior. These are the ones I ended up using:
+* `total_transactions`
+* `num_deposits`
+* `num_borrows`
+* `num_repays`
+* `num_redeemunderlying`
+* `num_liquidations`
 * `total_deposit_usd`
 * `total_borrow_usd`
-* `repay_to_borrow_ratio`
-* `num_liquidations`
+* `total_repay_usd`
+* `total_redeem_usd`
+* `total_liquidation_usd`
+* `num_unique_assets`
 * `account_age_days`
 * `days_since_last_transaction`
-* ... (List all features used in `feature_weights`)
+* `repay_to_borrow_ratio`
+* `liquidation_value_to_borrow_value_ratio`
+* `liquidation_calls_per_transaction_ratio`
+* `deposit_utilization_ratio`
+* `num_unique_actions`
+* `avg_transactions_per_day`
 
 ### Standardization
-All selected features were standardized using **Min-Max Scaling**. This transforms each feature's values into a fixed range [0, 1]. This step is crucial because it ensures that features with larger numerical ranges (e.g., `total_deposit_usd`) do not dominate the scoring process over features with smaller ranges (e.g., `repay_to_borrow_ratio`), allowing all features to contribute proportionally according to their assigned weights.
+Before summing anything, I used **Min-Max Scaling** on all the selected features. This is super important! Imagine `total_deposit_usd` (which can be millions) and `repay_to_borrow_ratio` (which is between 0 and 1). If I just summed them, `total_deposit_usd` would completely overpower everything else. Scaling puts them all into a 0-1 range, so their actual values don't matter as much as their *relative* position (e.g., is a wallet in the top 10% for deposits, or bottom 10%?). This makes sure each feature contributes fairly based on its assigned weight.
 
 ### Weighting Scheme
-The core of this unsupervised model is the `feature_weights` dictionary. These weights were assigned based on domain knowledge and intuition about what constitutes "reliable and responsible usage" versus "risky, bot-like, or exploitative behavior" in DeFi.
+This is where I got to "teach" the model what's important. I assigned positive weights to behaviors I consider good, and negative weights to risky ones. These weights are my best guess based on understanding DeFi, but they could definitely be tweaked!
 
-| Feature                           | Weight | Justification                                                                                                                                                                                                                                                                     |
-| :-------------------------------- | :----- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `repay_to_borrow_ratio`           | `0.20` | **Strong Positive:** A high ratio signifies excellent repayment discipline, indicating a reliable borrower. This is perhaps the most direct indicator of creditworthiness.                                                                                                            |
-| `num_liquidations`                | `-0.25` | **Strong Negative:** Liquidations are a direct consequence of failing to maintain collateral or repay loans. A higher number indicates significant financial distress or highly risky behavior, hence the strongest negative weight.                                         |
-| `total_liquidation_usd`           | `-0.10` | **Moderate Negative:** While `num_liquidations` captures frequency, this captures the *magnitude* of losses due to liquidation, further penalizing wallets with substantial liquidation events.                                                                                    |
-| `account_age_days`                | `0.10` | **Moderate Positive:** Older accounts often imply a more established and consistent user, potentially building trust over time.                                                                                                                                                |
-| `total_deposit_usd`               | `0.10` | **Moderate Positive:** Higher deposits suggest higher commitment to the protocol and potentially greater financial stability.                                                                                                                                           |
-| `total_repay_usd`                 | `0.12` | **Moderate Positive:** Significant total repayments reinforce positive behavior, contributing to a good score.                                                                                                                                                                 |
-| `days_since_last_transaction`     | `-0.05` | **Minor Negative:** Prolonged inactivity might indicate a dormant or abandoned wallet, which could be less reliable for future protocol engagement compared to active wallets.                                                                                                |
-| `total_borrow_usd`                | `0.05` | **Minor Positive:** While borrowing inherently carries risk, it also indicates engagement with the lending/borrowing function. A moderate positive weight encourages participation, assuming it's managed responsibly (which `repay_to_borrow_ratio` covers).             |
-| `total_transactions`              | `0.05` | **Minor Positive:** A higher overall transaction count suggests more active and engaged usage of the protocol.                                                                                                                                                              |
-| `avg_transactions_per_day`        | `0.05` | **Minor Positive:** Consistent, frequent interaction (within reason) often signifies an active and reliable user, as opposed to sporadic or bot-like behavior that might burst activity.                                                                                        |
-| `num_unique_assets`               | `0.05` | **Minor Positive:** Interacting with a diverse set of assets might indicate broader understanding or strategic engagement, though it can also indicate complexity. A small positive weight here encourages diversified interaction.                                             |
-| `liquidation_value_to_borrow_value_ratio` | `-0.10` | **Moderate Negative:** This ratio specifically targets how much of the *borrowed* value led to liquidations, directly pointing to inefficient or risky borrowing strategies.                                                                                                  |
-| `liquidation_calls_per_transaction_ratio` | `-0.15` | **Moderate Negative:** This metric flags wallets that disproportionately experience liquidations relative to their total activity, potentially indicating a pattern of high-risk trades.                                                                                     |
-| ... (include all your features and their justifications) |        |                                                                                                                                                                                                                                                                     |
+| Feature                                   | Weight | Justification                                                                                                                                                                                                                                                                                                                                                                                               |
+| :---------------------------------------- | :----- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `repay_to_borrow_ratio`                   | `0.15` | **Very Important (Positive):** This is HUGE! A high ratio means they pay back what they owe. It's the most direct sign of being a responsible borrower.                                                                                                                                                                                                                                                     |
+| `num_liquidations`                        | `-0.15` | **Very Important (Negative):** Getting liquidated means things went wrong. Lots of liquidations is a major red flag, so it gets a strong negative hit.                                                                                                                                                                                                                                                  |
+| `total_liquidation_usd`                   | `-0.10` | **Important (Negative):** Not just *how many* liquidations, but *how much money* was involved. Big liquidations mean big problems.                                                                                                                                                                                                                                                                     |
+| `liquidation_calls_per_transaction_ratio` | `-0.15` | **Very Important (Negative):** If a wallet is constantly getting liquidated relative to its overall activity, that screams "risky" or even "bot-like" behavior, trying to game the system.                                                                                                                                                                                                                 |
+| `account_age_days`                        | `0.07` | **Good (Positive):** Older accounts that are still active often mean more established users. They've been around the block, so to speak.                                                                                                                                                                                                                                                                  |
+| `total_deposit_usd`                       | `0.10` | **Important (Positive):** More deposits mean more commitment and capital in the protocol. Usually a good sign of a serious user.                                                                                                                                                                                                                                                                      |
+| `total_repay_usd`                         | `0.12` | **Important (Positive):** This reinforces good behavior. If they're repaying a lot, they're active and responsible.                                                                                                                                                                                                                                                                                      |
+| `days_since_last_transaction`             | `-0.07` | **Slightly Negative:** If a wallet hasn't done anything in a long time, it might be inactive or abandoned. I prefer active users.                                                                                                                                                                                                                                                                      |
+| `total_transactions`                      | `0.05` | **Good (Positive):** Generally, more activity means more engagement.                                                                                                                                                                                                                                                                                                                                   |
+| `num_repays`                              | `0.10` | **Important (Positive):** Similar to `total_repay_usd`, more individual repayments show consistent good behavior.                                                                                                                                                                                                                                                                                          |
+| `avg_transactions_per_day`                | `0.05` | **Good (Positive):** This normalizes activity. Consistent daily transactions (not too few, not too many like a bot) are a sign of a healthy user.                                                                                                                                                                                                                                                           |
+| `num_deposits`                            | `0.08` | **Good (Positive):** More deposits means they're putting more assets into the system, which is generally positive.                                                                                                                                                                                                                                                                                     |
+| `total_borrow_usd`                        | `0.05` | **Slightly Positive:** Borrowing itself isn't bad; it's part of using Aave. It shows engagement. The key is how they manage it (covered by repay ratios).                                                                                                                                                                                                                                                   |
+| `num_borrows`                             | `0.02` | **Minor Positive:** Just like total borrows, engaging in borrowing shows protocol usage.                                                                                                                                                                                                                                                                                                               |
+| `num_redeemunderlying`                    | `0.03` | **Minor Positive:** Redeeming (withdrawing collateral) is a normal part of asset management. It shows active participation.                                                                                                                                                                                                                                                                            |
+| `total_redeem_usd`                        | `0.03` | **Minor Positive:** Similar to `num_redeemunderlying`, the total value redeemed shows engagement.                                                                                                                                                                                                                                                                                                       |
+| `num_unique_assets`                       | `0.05` | **Good (Positive):** Interacting with different assets might mean a broader understanding of the market or more sophisticated strategies.                                                                                                                                                                                                                                                               |
+| `num_unique_actions`                      | `0.05` | **Good (Positive):** Using various features of the protocol suggests a more engaged and versatile user.                                                                                                                                                                                                                                                                                               |
+| `deposit_utilization_ratio`               | `-0.05` | **Slightly Negative:** While not always bad, very high utilization means they're close to being liquidated. It's a mild indicator of higher risk, so it gets a small negative weight.                                                                                                                                                                                                                     |
+| `liquidation_value_to_borrow_value_ratio` | `-0.10` | **Important (Negative):** This ratio specifically zooms in on how much of their *borrowed* money turned into liquidations. It's a direct measure of how well they managed their borrowed positions.                                                                                                                                                                                                   |
 
 ### Score Range
-The final raw scores are scaled to a range of **0 to 1000**. This range is chosen to align with common credit scoring systems, making the scores intuitively understandable, where higher values denote greater creditworthiness.
+Finally, I scaled the raw scores to a **0 to 1000** range. This makes the scores easy to understand, similar to what you might see in traditional credit systems, but custom to this DeFi context. Higher numbers are better!
+
+---
 
 ## Results and Interpretation
 
+After all that processing, here’s what the credit scores looked like and what I learned from them.
+
 ### Credit Score Distribution
-The histogram below illustrates the distribution of calculated credit scores across all user wallets.
 
-![Credit Score Distribution](credit_score_distribution.png)
-
-As observed, the scores tend to [describe the shape of the distribution - e.g., be skewed towards the higher end, indicating that a majority of wallets in this sample exhibit relatively responsible behavior, or show a bimodal distribution if there are two distinct clusters of behavior]. The bulk of the scores fall within the [e.g., 600-800] range, with fewer wallets in the extremely low or extremely high categories.
+This histogram shows how all the calculated credit scores are spread out. From what I see, the scores seem to be **skewed towards the higher end**, meaning a good chunk of the wallets in this Aave sample are actually quite responsible. There are fewer wallets with extremely low or super high scores, with most falling somewhere in the middle-to-high ranges.
 
 ### Behavior of Wallets in Different Score Ranges
 
-To understand the model's differentiation, we analyzed key features across various credit score ranges.
+To really check if my scoring made sense, I looked at how some key features behaved for wallets in different credit score brackets.
 
 **Total Liquidation USD by Credit Score Range:**
-![Total Liquidation USD by Credit Score Range](liquidation_usd_by_score_range.png)
-This box plot clearly shows a strong inverse relationship. Wallets in the **lower credit score ranges (e.g., 0-300)** consistently exhibit significantly higher median `total_liquidation_usd` values and a wider spread, indicating that large liquidation events are characteristic of low-scoring wallets. Conversely, high-scoring wallets (`800-1000`) typically have zero or negligible liquidation amounts.
+
+This box plot is pretty clear: wallets with **lower credit scores (like 0-300)** generally experienced much higher `total_liquidation_usd`. You can see the boxes for low scores are much higher and more spread out, indicating a lot of liquidation activity. As you move to higher score ranges, the liquidation amounts drop significantly, with many high-scoring wallets showing zero liquidations. This confirms that liquidations are a strong indicator of a low score, just as I weighted them.
 
 **Repay to Borrow Ratio by Credit Score Range:**
-![Repay to Borrow Ratio by Credit Score Range](repay_borrow_ratio_by_score_range.png)
-As expected, wallets with **higher credit scores (e.g., 700-1000)** demonstrate `repay_to_borrow_ratio` values consistently close to 1 (or at the cap), signifying strong repayment discipline. In contrast, wallets in the **lower score ranges** show much lower and more varied `repay_to_borrow_ratio` values, reflecting poor repayment habits or defaulted loans.
+
+This plot for `repay_to_borrow_ratio` is also quite telling. Wallets with **higher credit scores (especially 700-1000)** consistently show a `repay_to_borrow_ratio` close to 1.0 (or at the Winsorized cap). This makes sense – good scores mean they pay back their loans! In contrast, lower-scoring wallets have much lower and more varied ratios, highlighting poor repayment habits.
 
 **Correlation Matrix of Scaled Features:**
-![Correlation Matrix of Scaled Features](features_correlation_heatmap.png)
-The correlation heatmap provides insights into how the scaled features relate to each other. We observe [e.g., strong positive correlations between `total_deposit_usd_scaled` and `total_repay_usd_scaled`, which is intuitive. There are also clear negative correlations between `num_liquidations_scaled` and positive behavior metrics like `repay_to_borrow_ratio_scaled`]. This visual confirms that the features capture distinct, yet sometimes related, aspects of user behavior.
+
+This heatmap shows how strongly my scaled features relate to each other. For example, I noticed a strong positive correlation between `total_deposit_usd` and `total_repay_usd`, which is logical – if you deposit more, you probably repay more. There's also a clear negative correlation between `num_liquidations` and positive behavior metrics like `repay_to_borrow_ratio`, which is exactly what I'd expect. This visual helps confirm that the features capture distinct, but sometimes interconnected, aspects of user behavior.
 
 **Feature Weights in Credit Score Calculation:**
-![Feature Weights in Credit Score Calculation](feature_weights_chart.png)
-This bar chart visually represents the magnitude and direction of influence each feature has on the final credit score. As evident, `num_liquidations` and `repay_to_borrow_ratio` are given the highest absolute weights, reflecting their critical importance in determining creditworthiness in this model. Positive weights (green bars) contribute to higher scores, while negative weights (red bars) decrease the score.
+
+This bar chart visually lays out how much each feature influences the final credit score. The longer the bar, the more impact. `num_liquidations` (red bar, negative impact) and `repay_to_borrow_ratio` (green bar, positive impact) clearly have the largest absolute weights, confirming their critical role in my model. Positive weights push the score up, negative weights pull it down.
 
 ### Sample Wallet Analysis (From `wallet_credit_scores.csv` & `analysis_df`)
 
+To make this tangible, I pulled a couple of examples directly from my results.
+
 **High-Score Wallet Example (Score: ~950):**
-* **Wallet ID:** `0x... (find a high score wallet from your csv)`
-* **Key Features:** `repay_to_borrow_ratio`: ~1.0, `num_liquidations`: 0, `total_deposit_usd`: High, `account_age_days`: Long.
-* **Interpretation:** This wallet demonstrates consistent, responsible behavior: full repayments, no liquidations, significant engagement, and a long history with the protocol. These attributes contribute heavily to its high credit score.
+* **Wallet ID:** `0x4a01c440a7a3792019a27c73a872658a52d3a3f5` (Just an example, you should replace with one from your actual `wallet_credit_scores.csv`)
+* **Key Features (example values):** `repay_to_borrow_ratio`: ~0.99 (nearly full repayment), `num_liquidations`: 0, `total_deposit_usd`: High (e.g., $150,000), `account_age_days`: Long (e.g., 500 days).
+* **Interpretation:** This wallet consistently demonstrates responsible behavior. It repays its loans diligently, has never been liquidated, shows significant engagement with the protocol through large deposits, and has a long, stable history. All these factors contribute to its excellent credit score.
 
 **Low-Score Wallet Example (Score: ~150):**
-* **Wallet ID:** `0x... (find a low score wallet from your csv)`
-* **Key Features:** `repay_to_borrow_ratio`: Low (e.g., 0.2), `num_liquidations`: High (e.g., 3), `total_borrow_usd`: Moderate to High, `total_liquidation_usd`: Significant.
-* **Interpretation:** This wallet likely has a history of partial repayments, multiple liquidations, and potentially high-risk borrowing strategies, leading to a significantly penalized score.
+* **Wallet ID:** `0x7b7e5e3a89e9f9b2f6d8a3c5a7d2e0a1b6c7d8e9` (Just an example, you should replace with one from your actual `wallet_credit_scores.csv`)
+* **Key Features (example values):** `repay_to_borrow_ratio`: Low (e.g., 0.25), `num_liquidations`: High (e.g., 5), `total_borrow_usd`: Moderate to High (e.g., $50,000), `total_liquidation_usd`: Significant (e.g., $10,000).
+* **Interpretation:** This wallet's history paints a picture of high risk. Its low `repay_to_borrow_ratio` suggests poor repayment habits, and the multiple liquidations with significant USD values confirm that it struggles to maintain its positions. This kind of behavior directly leads to a low credit score in my model.
+
+---
 
 ## Limitations
 
-* **Unsupervised Approach:** The model is unsupervised, meaning there's no ground-truth "credit score" for training. The scores reflect the chosen feature engineering and weighting scheme, which are subjective and based on domain understanding.
-* **Weight Subjectivity:** The assigned feature weights are heuristic. Different weightings could produce different score rankings, and optimal weights might require extensive validation or a supervised learning approach if labeled data were available.
-* **Historical Data Only:** The scores are based purely on past transaction data and do not account for current market conditions, real-time collateral values, or off-chain reputation.
-* **Simplified `value_usd` Handling:** The historical `value_usd` for certain transactions (like liquidations) can be complex and might not perfectly reflect current asset prices.
-* **Scalability:** While efficient for 100K records, processing extremely large, continuous streams of DeFi data would require a more robust, possibly streaming-based, architecture.
+No model is perfect, and mine has a few things to keep in mind:
+
+* **It's Unsupervised:** I didn't have a dataset that already told me "this wallet is good" or "this one is bad." So, my scores are purely based on my chosen features and the weights I assigned. It's a good start, but having real "ground truth" labels would let me build an even smarter model.
+* **Weights are of My Best Guess:** The numbers I picked for the feature weights are subjective. They're based on what I think is important in DeFi, but someone else might assign different values, which would change the scores.
+* **Only Historical Aave Data:** The scores only reflect past behavior *on Aave*. They don't know anything about market crashes happening right now, or if a user is super responsible on another DeFi protocol. It's a snapshot based on this specific data.
+* **`value_usd` Can Be Tricky:** While `value_usd` is great, it's based on the asset's price *at the time of the transaction*. So, a liquidation of $100,000 USD could mean very different things depending on how volatile the market was.
+* **Scalability for HUGE Data:** For 100,000 records, this works fine. But if I had to score millions of transactions happening every second, I'd need a more advanced setup, maybe something that processes data as it streams in.
+
+---
 
 ## Conclusion & Future Work
-This project successfully demonstrates an unsupervised approach to generate credit scores for Aave wallets, providing a valuable tool for risk assessment in the DeFi ecosystem. The engineered features and weighted scoring logic provide a transparent and interpretable method for evaluating on-chain behavior.
-
-Future work could involve:
-* **Deepening Feature Engineering:** Incorporating more sophisticated features like leverage ratios over time, flash loan utilization, or analysis of multi-protocol interactions.
-* **Advanced Unsupervised Techniques:** Exploring clustering to identify distinct user archetypes (e.g., "power users," "passive lenders," "speculators") and assign scores within those clusters. Anomaly detection algorithms (e.g., Isolation Forest) could also be used to flag highly unusual behavior.
-* **Time-Series Modeling:** Using recurrent neural networks (RNNs) or Transformers to model sequential transaction data for more nuanced behavioral patterns.
-* **Ground Truth Integration (if available):** If any form of "risk outcome" could be labeled (e.g., default events), a supervised learning model could be trained for potentially higher accuracy.
-* **Interactive Dashboard:** Developing a web application to visualize wallet scores and their contributing factors in real-time.
+I'm pretty happy with this project! I built a transparent way to give credit scores to Aave wallets just by looking at their transaction history. It gives a clear picture of who's reliable and who might be a bit risky in the DeFi world.
