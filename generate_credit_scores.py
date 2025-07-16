@@ -7,7 +7,6 @@ import os
 from sklearn.preprocessing import MinMaxScaler
 import warnings
 
-# Suppress all warnings for cleaner output in this consolidated script
 warnings.filterwarnings('ignore')
 
 def generate_credit_scores(json_file_path='user-wallet-transactions.json', output_csv_path='wallet_credit_scores.csv'):
